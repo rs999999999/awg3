@@ -256,6 +256,7 @@ awg-backup restore файл.tar.gz # .enc распознаётся автома�
 - [amnezia-vpn/amneziawg-linux-kernel-module](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) — kernel-модуль для слоя 2.0.
 - [amnezia-vpn/amneziawg-tools](https://github.com/amnezia-vpn/amneziawg-tools) — утилиты `awg` и `awg-quick`.
 - [amnezia-vpn/amnezia-client](https://github.com/amnezia-vpn/amnezia-client) — клиентское приложение, под формат которого собираются ссылки `vpn://`.
+- [bivlked/amneziawg-installer](https://github.com/bivlked/amneziawg-installer) и [Vadim-Khristenko/AmneziaWG-Architect](https://github.com/Vadim-Khristenko/AmneziaWG-Architect) — подходы к установке AWG и генерации мимикрии.
 
 ## Лицензия
 
