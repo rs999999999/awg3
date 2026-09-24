@@ -13,6 +13,7 @@ import html
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -121,6 +122,103 @@ def obf_env() -> dict:
     env["AWG_IFACE2"] = i2
     env["AWG_IFACE3"] = i3
     return env
+
+
+# пресеты те же, что предлагает установщик; router и low объявлены без
+# header protection, паддинга и таймингов — на слое 3.0 это значит, что он
+# обфусцирует ровно как 2.0
+OBF_PRESETS = ("router", "low", "medium", "high", "paranoid")
+# исход операции пишется сюда: /run очищается при перезагрузке, и старый
+# результат не притворится свежим
+OBF_RESULT_FILE = "/run/awg-obf-reconf.result"
+OBF_WEAK_FOR_V3 = ("router", "low")
+
+
+def layer_client_count(v3: bool):
+    """Сколько клиентов потеряют доступ при смене профиля этого слоя.
+
+    None — определить не удалось. Это не то же самое, что «клиентов нет»:
+    awg_names отбрасывает код возврата, и любая ошибка `awg-client list` дала
+    бы успокоительный ноль ровно тогда, когда со слоем что-то не так."""
+    rc, out, _ = run([CLIENT_SH, "list", "awg3" if v3 else "awg2"])
+    if rc != 0:
+        return None
+    return len({s.strip() for s in out.splitlines() if NAME_RE.match(s.strip())})
+
+
+def obf_apply_cmd(v3: bool, preset: str = "", tpl: str = "") -> list:
+    """Команда для transient-юнита: сменить профиль слоя и перевыпустить конфиги.
+
+    Пути к конфигам не передаём: awg-obfuscation.sh сам читает services.env и
+    берёт интерфейс своего слоя.
+
+    regen-all не выполняется, если профиль не лёг на сервер вовсе: иначе
+    клиентам раздались бы конфиги от профиля, которого там нет. А вот при коде 3
+    («в файлы легло, до туннеля не доехало») он нужен: конфиг сервера уже
+    изменился, и клиенты обязаны за ним последовать.
+
+    Исход пишется в файл, а не в лог: юнит запущен с --collect и до опроса не
+    доживает, а хвост лога забивает regen-all — по строке на каждый конфиг.
+    """
+    parts = [shlex.quote(OBF_SH)]
+    if v3:
+        parts.append("--v3")
+    # --regenerate обязателен даже при смене пресета. Без него host, MTU и fp
+    # берутся из дефолтов скрипта, и первая же смена профиля из бота стирает
+    # Endpoint и MTU, записанные установщиком. Явный --preset при этом сильнее
+    # сохранённого — ради этого и делался приоритет флагов.
+    parts.append("--regenerate")
+    if preset:
+        parts += ["--preset", shlex.quote(preset)]
+        if tpl and tpl != "auto":
+            parts += ["--template", shlex.quote(tpl)]
+    parts.append("--apply")
+    r = shlex.quote(OBF_RESULT_FILE)
+    return ["bash", "-c", "\n".join([
+        ": > " + r,
+        " ".join(parts),
+        "rc=$?",
+        'if [ "$rc" = 0 ]; then ph=applied',
+        'elif [ "$rc" = 3 ]; then ph=unconfirmed',
+        "else echo result=apply_failed > " + r + "; exit 1",
+        "fi",
+        "if " + shlex.quote(CLIENT_SH) + " regen-all; then echo result=$ph > " + r,
+        "else echo result=regen_failed > " + r + "; exit 1",
+        "fi",
+    ])]
+
+
+def obf_result() -> str:
+    """Исход операции — из файла, а не из хвоста лога.
+
+    regen-all печатает по строке на каждый клиентский конфиг, и предупреждения
+    обфускатора гарантированно выпадают из окна лога. Кода возврата тоже не
+    остаётся — юнит запущен с --collect и до опроса не доживает."""
+    try:
+        for line in open(OBF_RESULT_FILE, encoding="utf-8"):
+            if line.startswith("result="):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def obf_result_note(res: str, ver: str, logf: str) -> str:
+    if res == "applied":
+        return (f"✅ Профиль слоя {ver} применён, конфиги клиентов пересозданы.\n"
+                f"⚠️ Каждому клиенту слоя {ver} нужно заново скачать и импортировать "
+                f"конфиг.\nПорты и ключи не менялись.")
+    if res == "unconfirmed":
+        return (f"⚠️ Профиль записан и конфиги пересозданы, но демон не подтвердил "
+                f"параметры 3.0 — туннель может работать как 2.0.\nЛог: {logf}")
+    if res == "regen_failed":
+        return (f"❌ Сервер уже на новом профиле, а конфиги клиентов пересоздать не "
+                f"удалось: клиенты слоя {ver} сейчас без связи.\n"
+                f"Повтори вручную: <code>awg-client regen-all</code>\nЛог: {logf}")
+    if res == "apply_failed":
+        return (f"❌ Профиль не применён. Конфиги клиентов НЕ трогались.\nЛог: {logf}")
+    return (f"❓ Операция завершилась, но исход неизвестен (юнит убит?).\n"
+            f"Проверь состояние: 🩺 Диагностика.\nЛог: {logf}")
 
 
 def unit_active(unit: str) -> bool:
@@ -353,15 +451,43 @@ def awg_names(svc: str) -> list:
 
 # ── отправка артефактов (отдельными сообщениями) ─────────────────────────────
 
+# Приложение Amnezia с 5.0 считает версию протокола само и знает ровно одну
+# тройку — 3.1; строки «3.0» в нём нет вовсе. Любой непустой параметр слоя 3
+# (у нас это HeaderProtectionKey) сразу даёт «version 3.1». То есть цифра в
+# приложении и наши подписи расходятся ЗАКОНОМЕРНО, и переименовывать слой
+# нельзя: он работает на 3.0, а 3.1 не используется намеренно (регрессия
+# kmod #215 и amnezia-client #3043). Объясняем расхождение там, где человек
+# его встречает, — вместе с выданным конфигом.
+V3_APP_NOTE = ("\n\nℹ️ Приложение Amnezia 5.0.1.5+ подпишет этот профиль как "
+               "«AmneziaWG (version 3.1)» — так и должно быть. Начиная с 5.0 "
+               "клиент считает версию сам и знает только 3.1; сервер отдаёт "
+               "параметры 3.0 полностью, на работу это не влияет.")
+
+
+def svc_is_v3(svc: str) -> bool:
+    """Слой 3.0: у него отдельные сервисы и отдельный профиль обфускации."""
+    return svc in ("awg3",)
+
+
 async def send_awg_files(chat: int, svc: str, name: str):
     base = os.path.join(CLIENT_DIR, svc, f"{svc}-{name}")
     conf, qr, vpn = base + "-am.conf", base + ".png", base + ".vpn"
     if os.path.exists(conf):
-        await bot.send_document(chat, FSInputFile(conf, filename=f"{name}.conf"),
-                                caption=f"📄 {svc}/{name} — AmneziaWG")
-    if os.path.exists(qr):
+        await bot.send_document(
+            chat, FSInputFile(conf, filename=f"{name}.conf"),
+            caption=f"📄 {svc}/{name} — AmneziaWG"
+                    + (V3_APP_NOTE if svc_is_v3(svc) else ""))
+    # getsize > 0 — страховка от битого нулевого PNG: send_photo на пустом файле
+    # роняет хендлер целиком, и пользователь остаётся с «⏳ Создаю…» навсегда.
+    if os.path.exists(qr) and os.path.getsize(qr) > 0:
         await bot.send_photo(chat, FSInputFile(qr),
                              caption="📱 QR — отсканируй в приложении AmneziaWG")
+    else:
+        # Молча пропасть QR не должен: экспортёр теперь не падает на слишком
+        # длинном конфиге, а просто не делает картинку — объясняем, что дальше.
+        await bot.send_message(
+            chat, "ℹ️ QR не сгенерирован: конфиг не влезает в QR-код. "
+                  "Импортируй файл .conf или ссылку vpn:// ниже.")
     if os.path.exists(vpn):
         uri = open(vpn, encoding="utf-8").read().strip()
         await bot.send_message(chat, "🔗 <b>Ссылка vpn:// для приложения Amnezia</b>:",
@@ -585,10 +711,18 @@ async def on_cb(c: CallbackQuery, state: FSMContext):
     if d in ("reconf:preset", "reconf:preset:2", "reconf3:preset"):
         p = "reconf3" if d.startswith("reconf3") else "reconf"
         ttl = " 3.0" if p == "reconf3" else ""
-        return await show(c, f"🛠 <b>Перенастройка обфускации{ttl}</b>\nИнтенсивность:",
+        # Для слоя 3.0 «поменьше шума» значит не то, что для 2.0: router и low
+        # объявлены с header_protection=False, content_padding=None и
+        # timings=False. Выбрав их, владелец получает слой 3.0 без единого
+        # признака 3.0 — и потом ищет поломку там, где её нет.
+        hint = ("\n\n⚠️ <b>router</b> и <b>low</b> — без header protection, "
+                "паддинга и таймингов: слой 3.0 на них работает как 2.0.\n"
+                "Полный набор 3.0 начинается с <b>medium</b>." if p == "reconf3" else "")
+        return await show(c, f"🛠 <b>Перенастройка обфускации{ttl}</b>\n"
+                          f"Интенсивность:{hint}",
                           kb([[("router", f"{p}:p:router"), ("low", f"{p}:p:low")],
                               [("medium", f"{p}:p:medium"), ("high", f"{p}:p:high")],
-                              [("paranoid", f"{p}:p:paranoid")], back("upd:menu")]))
+                              [("paranoid", f"{p}:p:paranoid")], back("obf:menu")]))
     if d.startswith("reconf:p:") or d.startswith("reconf3:p:"):
         p, _, preset = d.split(":", 2)
         return await show(c, f"Пресет <b>{preset}</b>. Мимикрия:",
@@ -600,23 +734,71 @@ async def on_cb(c: CallbackQuery, state: FSMContext):
                                ("dns", f"{p}:t:{preset}:dns")],
                               [("mixed", f"{p}:t:{preset}:mixed")],
                               back(f"{p}:preset")]))
-    if d.startswith("reconf:t:") or d.startswith("reconf3:t:"):
-        p, _, preset, tpl = d.split(":", 3)
-        v3 = p == "reconf3"
+    if d.startswith("reconf:t:") or d.startswith("reconf3:t:") \
+            or d in ("obf:regen", "obf:regen:3"):
+        # Шаг подтверждения. Раньше выбор шаблона применял профиль СРАЗУ, и одно
+        # случайное нажатие отключало всех клиентов слоя без единого вопроса.
+        # Кнопка «новые сигнатуры» делала то же самое и вовсе без экрана: она
+        # зовёт --regenerate, а тот сам ставит APPLY=1 и перезапускает интерфейс.
+        if d.startswith("obf:regen"):
+            v3 = d.endswith(":3"); preset = ""; tpl = ""
+            go = "obf:regen:go:3" if v3 else "obf:regen:go"
+            btn, home = "🎲 Да, перевыпустить сигнатуры", "obf:menu"
+        else:
+            p, _, preset, tpl = d.split(":", 3)
+            v3 = p == "reconf3"
+            go = f"{p}:go:{preset}:{tpl}"
+            btn, home = "✅ Да, сменить профиль", f"{p}:preset"
+        ver, other = ("3.0", "2.0") if v3 else ("2.0", "3.0")
+        n = layer_client_count(v3)
+        who = (f"<b>{n}</b>" if n is not None
+               else "<b>не удалось определить</b> — проверь <code>awg-client list</code>")
+        if preset:
+            what = f"Новый профиль: <b>{preset}</b> / {tpl}"
+            weak = ("\n⚠️ Пресет <b>{}</b> объявлен без header protection: слой 3.0 "
+                    "на нём обфусцирует ровно как 2.0.".format(preset)
+                    if v3 and preset in OBF_WEAK_FOR_V3 else "")
+        else:
+            what = ("Пресет остаётся прежним — меняются только сигнатуры "
+                    "(I-пакеты и H-диапазоны).")
+            weak = ""
+        return await show(
+            c,
+            f"⚠️ <b>Смена профиля обфускации — слой {ver}</b>\n"
+            f"{what}{weak}\n\n"
+            f"Параметры обфускации обязаны совпадать на сервере и у клиента, "
+            f"поэтому <b>все выданные конфиги слоя {ver} перестанут работать</b>.\n"
+            f"• затронуто клиентов: {who}\n"
+            f"• конфиги пересоздадутся сами, но каждому придётся заново скачать "
+            f"свой (Клиенты → имя → Скачать конфиг)\n"
+            f"• туннель слоя {ver} на время операции разорвётся\n"
+            f"• слой {other} продолжит работать: его профиль не меняется",
+            kb([[(btn, go)], back(home)]))
+
+    if d.startswith("reconf:go:") or d.startswith("reconf3:go:") \
+            or d.startswith("obf:regen:go"):
+        if d.startswith("obf:regen:go"):
+            v3 = d.endswith(":3"); preset = ""; tpl = ""
+        else:
+            p, _, preset, tpl = d.split(":", 3)
+            v3 = p == "reconf3"
         ver = "3.0" if v3 else "2.0"
-        await show(c, f"⏳ Применяю {preset}/{tpl} к {ver}…", kb([back("upd:menu")]))
-        args = [OBF_SH] + (["--v3"] if v3 else []) + \
-               ["--preset", preset, "--fp", "chrome", "--apply"]
-        if tpl != "auto":
-            args[-4:-4] = ["--template", tpl]
-        rc, out, err = run(args, timeout=180, env=obf_env())
+        # Операция долгая: смена профиля перезапускает интерфейс, а regen-all
+        # на сотне клиентов идёт минутами. В обработчике callback её держать
+        # нельзя — Telegram оборвёт запрос, а бот всё это время глухой.
+        # Юнит заодно служит замком: второй админ получит отказ, а не гонку.
+        unit = "awg-obf-reconf"
+        logf = f"{LOG_DIR}/awg-obf-reconf.log"
+        rc, _, err = start_bg_unit(unit, obf_apply_cmd(v3, preset, tpl), logf)
         if rc != 0:
-            return await show(c, f"❌ {html.escape(err or out)[:800]}", kb([back("upd:menu")]))
-        run([CLIENT_SH, "regen-all"], timeout=300)
-        return await show(c, f"✅ Профиль <b>{preset}/{tpl}</b> ({ver}) применён, конфиги "
-                          "клиентов пересозданы.\n⚠️ Клиентам нужно переимпортировать "
-                          "конфиги (Скачать конфиг → заново в приложение).\n"
-                          "Порты и ключи не менялись.", kb([back("upd:menu")]))
+            return await show(c, f"❌ {html.escape(err)[:400]}", kb([back("obf:menu")]))
+        title = (f"🛠 <b>Меняю профиль {ver} на {preset}/{tpl}…</b>" if preset
+                 else f"🎲 <b>Перевыпускаю сигнатуры слоя {ver}…</b>")
+        await watch_unit(c, unit, logf, title, "", back_cb="obf:menu")
+        return await show(c, f"🛠 <b>Слой {ver}</b>\n"
+                          f"<pre>{html.escape(log_tail(logf))}</pre>\n\n"
+                          f"{obf_result_note(obf_result(), ver, logf)}",
+                          kb([back("obf:menu")]), stamp=True)
 
     if d in ("doctor:run", "doctor:deep", "doctor:selftest"):
         deep = d == "doctor:deep"
@@ -644,14 +826,18 @@ async def on_cb(c: CallbackQuery, state: FSMContext):
         # у слоёв 2.0 и 3.0 отдельные профили (obfuscation.env / obfuscation3.env):
         # разные интерфейсы, разные датапасы. Если стоят оба — показываем оба ряда.
         _l2, _l3 = layers_available()
+        # «Сменить» раньше вело на obf:regen, который пресет НЕ меняет — он
+        # лишь перевыпускает сигнатуры внутри прежнего пресета. Смена пресета
+        # жила в меню обновлений, где её никто не искал.
         rows = []
         if _l2:
-            rows.append([("👁 Показать 2.0", "obf:show"), ("🔄 Сменить 2.0", "obf:regen")]
-                        if _l3 else [("👁 Показать", "obf:show")])
-            if not _l3:
-                rows.append([("🔄 Перегенерировать", "obf:regen")])
+            rows.append([("👁 Показать 2.0", "obf:show"), ("🎲 Новые сигнатуры 2.0", "obf:regen")]
+                        if _l3 else [("👁 Показать", "obf:show"),
+                                     ("🎲 Новые сигнатуры", "obf:regen")])
         if _l3:
-            rows.append([("👁 Показать 3.0", "obf:show:3"), ("🔄 Сменить 3.0", "obf:regen:3")])
+            rows.append([("👁 Показать 3.0", "obf:show:3"),
+                         ("🎲 Новые сигнатуры 3.0", "obf:regen:3")])
+        rows.append([("🛠 Сменить пресет", "reconf:preset")])
         rows.append(back())
         return await show(c, "🛡 Обфускация:", kb(rows))
     if d in ("obf:show", "obf:show:3"):
@@ -660,18 +846,6 @@ async def on_cb(c: CallbackQuery, state: FSMContext):
         head = "🛡 <b>AmneziaWG 3.0</b>\n" if v3 else ""
         return await show(c, f"{head}<code>{html.escape((out or err)[:3500])}</code>",
                           kb([back("obf:menu")]))
-    if d in ("obf:regen", "obf:regen:3"):
-        v3 = d.endswith(":3")
-        ver = "3.0" if v3 else "2.0"
-        await show(c, f"⏳ Перегенерация профиля {ver}…", kb([back("obf:menu")]))
-        rc, out, err = run([OBF_SH] + (["--v3"] if v3 else []) + ["--regenerate"],
-                           timeout=120, env=obf_env())
-        if rc == 0:
-            run([CLIENT_SH, "regen-all"], timeout=180)
-            return await show(c, f"✅ Новый профиль {ver} применён, конфиги пересозданы.\n"
-                              "Клиентам нужно переимпортировать конфиги.", kb([back("obf:menu")]))
-        return await show(c, f"❌ {html.escape(err or out)[:800]}", kb([back("obf:menu")]))
-
     if d == "backup:run":
         await show(c, "💾 Создаю бэкап…", kb([back()]))
         rc, out, err = run([BACKUP_SH, "backup"], timeout=300)
@@ -719,11 +893,11 @@ async def report_pending():
     # (сообщение, каким флагом пометить после успешной отправки)
     jobs = []
     if st.get("awg_upd") == "ok" and not st.get("awg_reported"):
-        jobs.append(("✅ <b>Слой AWG 2.0 обновлён</b>, бот перезапущен. "
+        jobs.append(("✅ <b>Код сервера обновлён</b>, бот перезапущен. "
                      "Клиенты и обфускация не менялись.",
                      dict(awg_reported=True, awg_upd=None)))
     elif st.get("awg_upd") == "fail" and not st.get("awg_reported"):
-        jobs.append(("❌ <b>Обновление AWG 2.0 не удалось.</b> "
+        jobs.append(("❌ <b>Обновление кода сервера не удалось.</b> "
                      "Лог: /var/log/az-awg-update.log",
                      dict(awg_reported=True, awg_upd=None)))
     if not jobs:

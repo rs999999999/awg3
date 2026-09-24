@@ -29,7 +29,68 @@ log() { printf '\033[1;36m[awg-client]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[awg-client]\033[0m %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 
-[ -f "$SERVICES" ] || die "нет $SERVICES — сначала установка"
+# ── замок на состояние слоя ────────────────────────────────────────────────
+# Под ним: серверные конфиги, каталог клиентов, expiry.tsv, stats.db. Берётся
+# внутри самих скриптов, а не в юнитах, — тогда под него попадают сразу все
+# входы: бот, меню, ssh и оба таймера (awg-stats раз в минуту, awg-expire раз
+# в пять). Образец — flock в bot/awg_bot.py, но там обёртка `flock файл cmd`,
+# а здесь нужен ДЕСКРИПТОР: замок обязан быть отпущен до перезапуска сервисов.
+#
+# /run, а не /tmp: у бота в юните PrivateTmp=true, его /tmp отдельный, и замок
+# в /tmp не сериализовал бы ничего, при этом выглядя рабочим. И не в $DEST —
+# этот каталог переписывает само восстановление, а смена inode у файла замка
+# означала бы две стороны, держащие РАЗНЫЕ замки, без единого признака беды.
+AWG_LOCK="${AWG_LOCK:-/run/awg3.lock}"
+
+# Возвращает 0 (открыт), 2 (нет flock), 3 (не открыть файл) — разные беды,
+# и путать их нельзя: «нет flock» там, где flock есть, отправляет искать не то.
+_lock_open() {
+    command -v flock >/dev/null 2>&1 || return 2
+    # Фигурные скобки обязательны. `exec 9>файл` с неудачной перенаправкой
+    # завершает неинтерактивную оболочку ЦЕЛИКОМ — `|| return` до неё не
+    # доходит; а `2>/dev/null`, приписанное к самому exec, применяется уже
+    # после открытия и сообщения не прячет. Без скобок восстановление на
+    # машине с недоступным на запись /run обрывалось посреди работы.
+    { exec 9>"$AWG_LOCK"; } 2>/dev/null || return 3
+}
+_lock_excuse() {  # _lock_excuse <код _lock_open> <что защищаем>
+    case "$1" in
+        2) err "нет flock (пакет util-linux): $2 идёт без защиты от таймеров" ;;
+        *) err "не открыть замок $AWG_LOCK: $2 идёт без защиты от таймеров" ;;
+    esac
+}
+# Для ручных операций: ждём. Отдельный код 1 именно на «не дождались» — у
+# `flock -w` на команде код 1 неотличим от отказа самой команды.
+lock_wait() {  # lock_wait <секунд> <что защищаем>
+    local o=0
+    _lock_open || o=$?
+    [ "$o" = 0 ] || { _lock_excuse "$o" "$2"; return 0; }
+    flock -w "$1" 9 && return 0
+    err "$2: за $1 с не удалось взять $AWG_LOCK — идёт другая операция"
+    return 1
+}
+# Для таймеров: не ждём ни секунды. У oneshot-юнитов TimeoutStartSec по
+# умолчанию 90 с, и ожидание кончилось бы SIGTERM посреди правки файлов.
+lock_try() {  # lock_try <что защищаем>
+    local o=0
+    _lock_open || o=$?
+    [ "$o" = 0 ] || { _lock_excuse "$o" "$1"; return 0; }
+    flock -n 9
+}
+# Скобки и здесь обязательны, но по другой причине, чем в _lock_open:
+# `exec` БЕЗ команды применяет перенаправления к самой оболочке НАВСЕГДА,
+# так что `exec 9>&- 2>/dev/null` тихо уводил в /dev/null весь дальнейший
+# stderr скрипта — вместе с сообщениями о неподнявшихся сервисах.
+lock_drop() { { exec 9>&-; } 2>/dev/null || true; }
+
+
+# Справка не требует установленного сервера: владелец, набравший --help на
+# чистой машине, получал отказ вместо справки. Проверка стоит здесь, а не в
+# диспетчере внизу, потому что до него дело просто не доходило.
+case "${1:-}" in
+    -h|--help|help) ;;
+    *) [ -f "$SERVICES" ] || die "нет $SERVICES — сначала установка" ;;
+esac
 
 default_service() {
     # shellcheck disable=SC1090
@@ -87,14 +148,27 @@ load_obfuscation() {
 
 server_pubkey() {
     # cut -d= -f2- сохраняет хвостовой '=' base64-ключа (awk -F' *= *' его срезал бы)
-    grep '^PrivateKey' "$SERVER_CONF" | head -1 | cut -d= -f2- | tr -d ' \t' | awg pubkey
+    # Читаем отдельно, а не одной трубой в awg pubkey: под pipefail grep без
+    # совпадения отдаёт 1, и вся команда умирала молча — без единой строки о
+    # том, что в серверном конфиге нет ключа. Пустой ключ здесь означает
+    # ненастроенный сервер, и сказать это надо вслух.
+    local priv
+    priv="$(grep '^PrivateKey' "$SERVER_CONF" | head -1 | cut -d= -f2- | tr -d ' \t' || true)"
+    [ -n "$priv" ] || die "в $SERVER_CONF нет PrivateKey — сервер не настроен"
+    printf '%s' "$priv" | awg pubkey
 }
 
 next_ip() {
     local used i
     used="$(grep -oE "AllowedIPs = ${SUBNET//./\\.}\.[0-9]+" "$SERVER_CONF" | grep -oE '[0-9]+$' || true)"
     for i in $(seq 2 254); do
-        echo "$used" | grep -qx "$i" || { echo "${SUBNET}.${i}"; return 0; }
+        # Без трубы: `echo | grep -q` под pipefail отдаёт 141 при совпадении в
+        # начале списка, и занятый адрес выдавался бы как свободный — двум
+        # клиентам достался бы один IP. В az-awg2 это уже исправлено.
+        case $'\n'"$used"$'\n' in
+            *$'\n'"$i"$'\n'*) ;;              # занят — берём следующий
+            *) echo "${SUBNET}.${i}"; return 0 ;;
+        esac
     done
     die "свободные адреса в ${SUBNET}.0/24 закончились"
 }
@@ -123,6 +197,17 @@ add_client() {
     [ -n "$host" ] || host="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
     dns="${DNS:-1.1.1.1, 8.8.8.8}"
 
+    # Ключ сервера берём ДО рендера, обычным присваиванием: die внутри $( ) в
+    # heredoc убивает только подоболочку — cat дописал бы «PublicKey = »
+    # пустым, и клиент получил бы заведомо нерабочий профиль со словом
+    # «создан». Здесь отказ виден вызывающему.
+    # `|| die` на самом присваивании: без него отказ `awg pubkey` (в отличие от
+    # отсутствия ключа, которое ловит сама server_pubkey) убивал бы add_client
+    # молча, и проверка на пустоту ниже стала бы недостижимой. Измерено:
+    # plain-присваивание с упавшей подстановкой под set -e роняет скрипт.
+    local spub
+    spub="$(server_pubkey)" || die "не удалось получить публичный ключ сервера — клиент не создан"
+    [ -n "$spub" ] || die "публичный ключ сервера пуст — клиент не создан"
     umask 077
     cat > "$conf" <<EOF
 [Interface]
@@ -133,7 +218,7 @@ MTU = ${MTU}
 ${AWG_OBFUSCATION}
 
 [Peer]
-PublicKey = $(server_pubkey)
+PublicKey = ${spub}
 PresharedKey = ${cpsk}
 Endpoint = ${host}:${PORT}
 AllowedIPs = 0.0.0.0/0, ::/0
@@ -155,8 +240,11 @@ AllowedIPs = ${cip}/32
 EOF
 
     # QR (сырой conf) + ссылка vpn:// + QR ссылки
-    "$PY" "$EXPORT" "$conf" --name "${SVC}-${name}" --outdir "$outdir" --all >/dev/null 2>&1 || \
-        log "экспортёр отработал с замечаниями — .conf на месте"
+    # stderr НЕ глушим: экспортёр объясняет там, почему не собрался QR —
+    # «не влезает в QR» и «нет segno/qrcode» лечатся по-разному, а с 2>&1
+    # обе причины выглядели одинаково молча.
+    "$PY" "$EXPORT" "$conf" --name "${SVC}-${name}" --outdir "$outdir" --all >/dev/null || \
+        log "экспортёр отработал с замечаниями (см. выше) — .conf на месте"
 
     local note=""
     if [ -n "$ttl" ]; then
@@ -173,8 +261,17 @@ EOF
 
     log "клиент '$name' ($SVC)${note} создан:"
     log "  conf  : $conf"
-    log "  QR    : ${outdir}/${SVC}-${name}.png"
-    log "  vpn://: ${outdir}/${SVC}-${name}.vpn"
+    # Путь печатаем по факту наличия файла: QR может не собраться (конфиг не
+    # влезает либо нет segno/qrcode), и обещание несуществующего файла отправляет
+    # владельца искать его на диске вместо чтения предупреждения выше.
+    if [ -f "${outdir}/${SVC}-${name}.png" ]; then
+        log "  QR    : ${outdir}/${SVC}-${name}.png"
+    else
+        log "  QR    : (не создан — см. предупреждение экспортёра выше)"
+    fi
+    if [ -f "${outdir}/${SVC}-${name}.vpn" ]; then
+        log "  vpn://: ${outdir}/${SVC}-${name}.vpn"
+    fi
     echo "$conf"
 }
 
@@ -186,12 +283,26 @@ del_client() {
     local conf="${outdir}/${SVC}-${name}-am.conf"
     [ -f "$conf" ] || die "клиент '$name' ($SVC) не найден"
     local cpriv cpub
-    cpriv="$(grep '^PrivateKey' "$conf" | head -1 | cut -d= -f2- | tr -d ' \t')"
-    cpub="$(printf '%s' "$cpriv" | awg pubkey)"
+    # `|| true` обязателен: под pipefail grep без совпадения отдаёт 1, и
+    # удаление умирало без единой строки вывода. В az-awg2 уже исправлено.
+    cpriv="$(grep '^PrivateKey' "$conf" | head -1 | cut -d= -f2- | tr -d ' \t' || true)"
+    [ -n "$cpriv" ] || die "в конфиге '$conf' нет PrivateKey — по ключу удалять нечего"
+    # Проверять здесь обязательно, и вот почему. expire_check зовёт del_client
+    # левым операндом ||, а в таком вызове errexit подавлен на ВСЁ тело
+    # функции: отказ `awg pubkey` не остановил бы удаление, а оставил бы cpub
+    # пустым. Фильтр ниже ищет вхождение подстроки, и пустая входит в любой
+    # блок — серверный конфиг вычищался бы целиком, молча, из-под таймера.
+    cpub="$(printf '%s' "$cpriv" | awg pubkey)" \
+        || die "не удалось вывести публичный ключ клиента из '$conf'"
+    [ -n "$cpub" ] || die "пустой публичный ключ клиента ('$conf') — серверный конфиг не трогаю"
     awg set "$IFACE" peer "$cpub" remove 2>/dev/null || true
     python3 - "$SERVER_CONF" "$cpub" <<'PY'
 import sys
 path, pub = sys.argv[1], sys.argv[2]
+# Пустой ключ сюда попасть уже не может, но цена ошибки — стёртый серверный
+# конфиг, поэтому проверяем ещё раз: пустая подстрока входит в любой блок.
+if not pub:
+    sys.exit("пустой PublicKey — фильтр совпал бы со всем файлом")
 blocks, cur = [], []
 for line in open(path, encoding="utf-8").read().splitlines():
     if line.strip().startswith("[Peer]"):
@@ -222,23 +333,41 @@ list_clients() {
 
 # ── пересобрать конфиги под текущий профиль ──────────────────────────────────
 regen_all() {
+    # сколько конфигов реально изменилось: см. итог в конце функции
+    local same=0 changed=0 changed_list="" before after
     # shellcheck disable=SC1090
     . "$SERVICES"
-    local svc conf name
+    local svc conf name prof v3 n_left missed=0
     # Ненужные слои отсеиваем ДО resolve_service: она завершается через die(),
     # то есть уронила бы весь regen-all, а не одну итерацию.
     for svc in awg2 awg3; do
         case "$svc" in
             awg2) [ "${LAYER2:-0}" = 1 ] || continue
-                  [ -f "$AWG_DIR/obfuscation.env" ] || continue ;;
+                  prof="$AWG_DIR/obfuscation.env"; v3="" ;;
             awg3) [ "${LAYER3:-0}" = 1 ] || continue
-                  [ -f "$AWG_DIR/obfuscation3.env" ] || continue ;;
+                  prof="$AWG_DIR/obfuscation3.env"; v3=" --v3" ;;
         esac
         [ -d "${CLIENT_DIR}/${svc}" ] || continue
+        # Пропуск слоя без профиля остаётся — иначе die() внутри
+        # load_obfuscation уронил бы пересборку у всех остальных слоёв. Но
+        # молчать о нём нельзя: слой включён, клиенты у него есть, а профиля
+        # нет — значит сервер уже на новом профиле, а эти конфиги остались на
+        # старом, и соединяться их владельцы перестанут. Итог внизу при этом
+        # честно печатал «переимпорт не нужен».
+        if [ ! -f "$prof" ]; then
+            n_left="$(find "${CLIENT_DIR}/${svc}" -name '*-am.conf' 2>/dev/null | wc -l || true)"
+            if [ "$n_left" = 0 ]; then continue; fi
+            err "слой $svc ПРОПУЩЕН: нет профиля $prof"
+            err "   $n_left конфигов остались на прежнем профиле — эти клиенты не соединятся"
+            err "   выпусти профиль (awg-obfuscation$v3 --regenerate --apply) и повтори regen-all"
+            missed=$((missed + 1))
+            continue
+        fi
         resolve_service "$svc"; load_obfuscation
         for conf in "${CLIENT_DIR}/${svc}"/*-am.conf; do
             [ -f "$conf" ] || continue
             name="$(basename "$conf" | sed "s/^${svc}-//;s/-am.conf//")"
+            before="$(md5sum "$conf" | cut -d" " -f1)"
             python3 - "$conf" "$AWG_OBFUSCATION" <<'PY'
 import sys
 path, block = sys.argv[1], sys.argv[2]
@@ -253,6 +382,13 @@ for line in txt:
         in_iface = True; out.append(line); continue
     if line.strip().startswith("[Peer]"):
         if in_iface:
+            # Хвостовые пустые строки [Interface] убираем ПЕРЕД вставкой:
+            # иначе каждый прогон regen-all добавлял бы ещё одну, файл
+            # менялся бы без единого содержательного изменения, и владелец
+            # думал бы, что клиентам пора раздавать конфиги заново.
+            while out and not out[-1].strip():
+                out.pop()
+            out.append("")
             out.extend(block.splitlines()); out.append("")
         in_iface = False; out.append(line); continue
     if key in obf:
@@ -260,11 +396,35 @@ for line in txt:
     out.append(line)
 open(path, "w", encoding="utf-8").write("\n".join(out) + "\n")
 PY
+            after="$(md5sum "$conf" | cut -d" " -f1)"
             "$PY" "$EXPORT" "$conf" --name "${svc}-${name}" \
-                --outdir "$(dirname "$conf")" --all >/dev/null 2>&1 || true
-            log "пересоздан: $svc/$name"
+                --outdir "$(dirname "$conf")" --all >/dev/null \
+                || log "  QR не собран для $svc/$name (см. предупреждение выше)"
+            if [ "$before" = "$after" ]; then
+                same=$((same+1))
+            else
+                changed=$((changed+1)); changed_list="$changed_list $svc/$name"
+                log "изменён: $svc/$name"
+            fi
         done
     done
+    # Итог важнее перечисления: после обновления слоя нужно знать не «что-то
+    # происходило», а придётся ли людям заново импортировать конфиги.
+    if [ "$changed" != 0 ]; then
+        log "Конфиги клиентов: $same без изменений, $changed изменено"
+        log "   Заново скачать конфиг нужно:$changed_list"
+    elif [ "$missed" = 0 ]; then
+        log "Конфиги клиентов: $same без изменений — переимпорт не нужен"
+    else
+        log "Конфиги клиентов: $same без изменений"
+    fi
+    # Ненулевой код: часть клиентов осталась на прежнем профиле. Обе вызывающих
+    # стороны это уже разбирают — install.sh печатает «повтори вручную», бот
+    # отвечает отказом, — и до сих пор обеим сообщалось об успехе.
+    if [ "$missed" != 0 ]; then
+        err "Слоёв пропущено: $missed — конфиги их клиентов НЕ пересобраны"
+        return 1
+    fi
     return 0
 }
 
@@ -277,13 +437,32 @@ expire_check() {
         [ -n "$name" ] || continue
         if [ "$now" -ge "$when" ] 2>/dev/null; then
             log "срок клиента '$name' ($svc) истёк — удаляю"
-            del_client "$name" "$svc" >/dev/null 2>&1 || true
+            # Подоболочка обязательна: die внутри del_client — это exit, и он
+            # оборвал бы ВЕСЬ прогон до mv ниже, оставив список просроченных
+            # нетронутым, а остальных — неудалёнными.
+            ( del_client "$name" "$svc" >/dev/null ) \
+                || log "клиента '$name' удалить не удалось — см. ошибку выше"
         else
             printf '%s\t%s\t%s\n' "$name" "$svc" "$when" >> "$tmp"
         fi
     done < "$EXPIRY_FILE"
     mv "$tmp" "$EXPIRY_FILE"
 }
+
+# Замок берётся на уровне диспетчера, а не внутри функций: expire_check зовёт
+# del_client, и второй flock на том же файле дал бы самодедлок.
+# Читающие команды (list, overview) оставлены без замка сознательно — иначе
+# бот вис бы на всё время восстановления.
+case "${1:-}" in
+    add|del|regen-all)
+        lock_wait 60 "изменение клиентов" \
+            || die "занято другой операцией (восстановление? обфускация?) — повтори" ;;
+    expire-check)
+        # Пропустить тик безопасно: следующий придёт через пять минут, а
+        # ожидание кончилось бы SIGTERM по TimeoutStartSec посреди правки.
+        lock_try "проверка сроков" \
+            || { log "состояние слоя занято — пропускаю тик"; exit 0; } ;;
+esac
 
 case "${1:-}" in
     add)
@@ -306,5 +485,8 @@ case "${1:-}" in
     list)         list_clients "${2:-}" ;;
     regen-all)    regen_all ;;
     expire-check) expire_check ;;
-    *) grep '^#' "$0" | sed 's/^# \?//'; exit 0 ;;
+    # Справка — это ШАПКА файла, а не все его комментарии: ниже по файлу
+    # идут заметки для читателя кода, и владелец получал их вместо справки,
+    # начиная с обрубленного шебанга.
+    *) awk 'NR==1||/^# *SPDX-/{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0 ;;
 esac

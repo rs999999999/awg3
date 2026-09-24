@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# tests/run.sh — вся приёмка одним прогоном.
+#
+#   bash tests/run.sh            # всё
+#   bash tests/run.sh obf        # только наборы, чьё имя содержит «obf»
+#
+# Ничего не устанавливает и не трогает систему: наборы работают на подставных
+# systemctl/ip/python3 во временных каталогах и разбирают НАСТОЯЩИЕ файлы
+# репозитория, а не свои копии. Поэтому прогон безопасен и на боевой машине.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$ROOT" || exit 1
+PY="${PYTHON:-python3}"
+FILTER="${1:-}"
+
+pass=0; fail=0; skipped=0
+FAILED=""
+
+ok()   { printf '  \033[1;32m✔\033[0m %s\n' "$1"; pass=$((pass+1)); }
+bad()  { printf '  \033[1;31m✘\033[0m %s\n' "$1"; fail=$((fail+1)); FAILED="$FAILED $1"; }
+head_() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
+# Логи GitHub Actions открываются только после входа, а аннотации публичны.
+# Поэтому причину отказа дублируем аннотацией: она видна и в pull request,
+# и снаружи, без доступа к логам.
+annotate() {  # annotate <набор> <вывод>
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    printf '::error title=%s::%s\n' "$1" \
+        "$(printf '%s' "$2" | sed 's/%/%25/g; s/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
+}
+
+run() {  # run <имя> <команда…>
+    local name="$1"; shift
+    case "$name" in
+        *"$FILTER"*) ;;
+        *) skipped=$((skipped+1)); return 0 ;;
+    esac
+    local out rc
+    out="$(timeout 300 "$@" 2>&1)"; rc=$?
+    # Аннотации из вывода набора переиздаём ВСЕГДА, а не только при падении.
+    # run() захватывает stdout, поэтому `::notice` от набора, который успешно
+    # пропустил свою главную часть (нет unshare), до раннера не доходил — и
+    # пропуск выглядел пройденной проверкой. Это ровно та ложная зелень, ради
+    # которой наборы и писались.
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then
+        printf '%s\n' "$out" | grep '^::notice' || true
+    fi
+    if [ "$rc" = 0 ]; then
+        ok "$name"
+    else
+        [ "$rc" = 124 ] && out="$out"$'\n'"(превышен лимит 300 с)"
+        bad "$name"
+        printf '%s\n' "$out" | tail -25 | sed 's/^/      /'
+        annotate "$name" "$(printf '%s\n' "$out" | tail -25)"
+    fi
+}
+
+head_ "Синтаксис"
+syn=0
+while IFS= read -r f; do
+    bash -n "$f" 2>/dev/null || { printf '  ✘ %s\n' "$f"; syn=1; }
+done < <(git ls-files '*.sh' 2>/dev/null || find . -name '*.sh' -not -path './.git/*')
+[ "$syn" = 0 ] && ok "bash -n по всем .sh" || bad "bash -n по всем .sh"
+
+pyc="$("$PY" -m compileall -q bin bot obfuscation tests 2>&1)"
+if [ -z "$pyc" ]; then ok "py_compile по всем .py"; else bad "py_compile по всем .py"; printf '%s\n' "$pyc" | sed 's/^/      /'; fi
+
+head_ "Установщик"
+run "раздельный пресет слоя 3.0 и приоритет флагов" \
+    bash tests/test_install_preset3.sh install.sh bin/awg-obfuscation.sh
+
+head_ "Обфускация: границы"
+run "окно junk-пакетов и неизменность на рабочем MTU" "$PY" tests/test_junk_range.py
+
+head_ "Пины апстрима"
+run "утилиты, модуль и датапас одной серии" bash tests/test_pins.sh
+
+head_ "Инвариант портов"
+run "порт объявленный, записанный и у клиентов — один" bash tests/test_ports.sh
+
+head_ "Прерывание операций"
+run "повторный запуск после смерти посередине приводит к согласованному состоянию" \
+    bash tests/test_interrupt.sh
+
+head_ "Аудит shell-паттернов"
+run "новых мест того же класса не появилось" "$PY" tests/audit_shell_patterns.py
+
+head_ "Ловушки bash"
+run "занятый порт, пустой адрес и конфиг без ключа не рушат прогон"     bash tests/test_bash_traps.sh
+
+head_ "Сухой прогон"
+run "--plan показывает то, что будет, и не трогает диск"     bash tests/test_plan.sh
+
+head_ "Обфускация"
+run "приоритет явных флагов над сохранённым профилем" \
+    bash tests/test_obf_preset.sh bin/awg-obfuscation.sh
+run "перезапуск после --apply и код возврата" \
+    bash tests/test_obf_restart.sh bin/awg-obfuscation.sh
+run "regen-all: пропущенный слой слышен и виден по коду" \
+    bash tests/test_regen_skip.sh
+run "секреты не читаются кем попало: профили клиентов и ключ слоя 3.0" \
+    bash tests/test_secret_perms.sh
+run "Enter в выборе версии означает «как есть», а не «ещё один слой»" \
+    bash tests/test_layer_choice.sh
+run "--help печатает справку, а не все комментарии файла" \
+    bash tests/test_help.sh
+
+head_ "Модель согласованности"
+run "CONSISTENCY.md сверен с кодом в обе стороны" \
+    bash tests/test_consistency_doc.sh
+
+head_ "Согласованность состояния"
+run "ключи и пиры: клиент без пира, сирота, дубликат адреса, чужой ключ сервера" \
+    bash tests/test_consistency.sh
+
+head_ "Адрес сервера"
+run "сверка хоста у клиентов и молчание там, где ответ недоказуем" \
+    bash tests/test_endpoint.sh
+
+head_ "Бэкап и восстановление"
+run "архив содержит клиентские ключи, а отказ доезжает до кода возврата" \
+    bash tests/test_restore_integrity.sh
+run "доктор целиком: исправный сервер молчит, сломанный говорит" \
+    bash tests/test_doctor_e2e.sh
+
+head_ "Диагностика"
+run "слой 3.0: «ключа нет» отличается от «спросить не удалось»" \
+    bash tests/test_doctor_v3.sh bin/awg-doctor.sh
+
+head_ "Бот"
+run "меню обфускации: предупреждение, фон, исход" "$PY" tests/test_bot_obfuscation.py
+run "пояснение про «version 3.1» у слоя 3.0"      "$PY" tests/test_bot_v3_note.py
+
+printf '\n\033[1m%s\033[0m\n' "Итог"
+printf '  прошло %d, упало %d' "$pass" "$fail"
+[ "$skipped" -gt 0 ] && printf ', пропущено по фильтру %d' "$skipped"
+printf '\n'
+if [ "$fail" != 0 ]; then
+    printf '  упавшие:%s\n' "$FAILED"
+    exit 1
+fi

@@ -49,6 +49,10 @@ CONF="$AWG_DIR/$IFACE.conf"
 V3="$AWG_DIR/$IFACE.v3"
 IENV="$AWG_DIR/$IFACE.env"
 
+# load_env сбрасывает ВЕСЬ набор ключей <iface>.env перед source,
+# включая те, что этот скрипт не читает: иначе второй вызов
+# унаследовал бы значения от первого.
+# shellcheck disable=SC2034
 load_env() {
     SUBNET=""; PORT=""; NAT=1; MTU=1380; ADDRESS=""
     WAN=""
@@ -118,9 +122,17 @@ cmd_configure() {
     if grep -q '__AWG' "$stripped"; then
         err "в $CONF остался плейсхолдер обфускации — запусти awg-obfuscation --v3 --regenerate"
     fi
-    if ! awg setconf "$IFACE" "$stripped"; then
-        err "awg setconf не принял $CONF — строка ниже:"
-        awg setconf "$IFACE" "$stripped" 2>&1 | head -3 >&2
+    # Вывод забираем с ПЕРВОЙ попытки. Раньше отказавшая команда запускалась
+    # второй раз уже внутри then, где errexit действует: pipefail проносил код
+    # awg мимо нулевого head, скрипт умирал прямо здесь, и ни rm -f, ни
+    # return 1 ниже не выполнялись. А "$stripped" — это вывод `awg-quick strip`,
+    # то есть ПРИВАТНЫЙ КЛЮЧ СЕРВЕРА, и он копился в /tmp на каждом неудачном
+    # старте юнита (Restart=on-failure).
+    local out rc=0
+    out="$(awg setconf "$IFACE" "$stripped" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        err "awg setconf не принял $CONF — строки ниже:"
+        printf '%s\n' "$out" | head -3 >&2
         rm -f "$stripped"
         return 1
     fi
